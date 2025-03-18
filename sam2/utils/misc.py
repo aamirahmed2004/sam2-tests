@@ -266,6 +266,10 @@ def load_video_frames_from_jpg_images(
 
     images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
     for n, img_path in enumerate(tqdm(img_paths, desc="frame loading (JPEG)")):
+        if compute_device == "cuda":
+            allocated = torch.cuda.memory_allocated(device=compute_device) / (1024 ** 3)  
+            reserved = torch.cuda.memory_reserved(device=compute_device) / (1024 ** 3)  
+            print(f"Frame {n}: GPU Memory - Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
         images[n], video_height, video_width = _load_img_as_tensor(img_path, image_size)
     if not offload_video_to_cpu:
         images = images.to(compute_device)
