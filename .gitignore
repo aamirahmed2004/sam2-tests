@@ -16,3 +16,4 @@ offload_state_outputs/
 offload_video_outputs/
 offload_both_outputs/
 sample_frames*/
+*.pt

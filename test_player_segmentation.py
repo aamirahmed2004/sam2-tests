@@ -20,7 +20,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
 import argparse
-from sam2.build_sam import build_sam2_video_predictor # move this file into cloned sam2 repo to resolve this import error
+from sam2.build_sam import build_sam2_video_predictor 
 
 if torch.cuda.is_available():
     device = torch.device("cuda")
@@ -104,6 +104,18 @@ def save_processed_images(frames_dir, frame_names, video_segments, frame_stride=
     plt.close("all")
 
     fig = plt.figure(figsize=(6, 4))
+    final_output_dir = os.path.join(BASE_PATH, output_dir, SAMPLE_FRAMES_DIR)
+    if not os.path.exists(final_output_dir):
+        os.mkdir(final_output_dir)
+
+    # Add counter before filename so that each outputs from run appear separately when browsing in the folder
+    counter = 0
+    output_path = os.path.join(final_output_dir, f'run{counter}_frame0.png')
+    while os.path.exists(output_path):
+        # Crude way of handling clashing filename so I don't overwrite outputs from different test runs 
+        counter += 1
+        output_path = os.path.join(final_output_dir, f'run{counter}_frame0.png')  
+
     for out_frame_idx in range(0, len(frame_names), frame_stride):
         image_path = os.path.join(frames_dir, frame_names[out_frame_idx])
         image = Image.open(image_path)
@@ -115,17 +127,7 @@ def save_processed_images(frames_dir, frame_names, video_segments, frame_stride=
         for out_obj_id, out_mask in video_segments[out_frame_idx].items():
             show_mask(out_mask, plt.gca(), obj_id=out_obj_id, image_size=image_size)
 
-        output_path = os.path.join(BASE_PATH, output_dir, SAMPLE_FRAMES_DIR)
-        if not os.path.exists(output_path):
-            os.mkdir(output_path)
-
-        # Crude way of handling clashing filename so I don't overwrite outputs from different test runs 
-        output_path = os.path.join(output_path, f'frame{out_frame_idx}.png')
-        counter = 1
-        while os.path.exists(output_path):
-            # add counter before filename so that each run appears separately when browsing in the folder
-            output_path = os.path.join(output_path, f'{counter}_frame{out_frame_idx}.png')  
-            counter += 1
+        output_path = os.path.join(final_output_dir, f'run{counter}_frame{out_frame_idx}.png')
 
         # print("Saving image", out_frame_idx)
         plt.savefig(output_path, bbox_inches='tight', pad_inches=0)
@@ -188,7 +190,7 @@ print(f"  Reserved: {model_reserved / (1024 ** 3):.2f} GB")
 # Don't need to display initial frame after we choose the points 
 # display_initial_frame(frames_dir, frame_names)
 
-inference_state = predictor.init_state(video_path=frames_dir, offload_video_to_cpu=args.offload_video, offload_state_to_cpu=args.offload_state)
+inference_state = predictor.init_state(video_path=frames_dir, offload_video_to_cpu=args.offload_video, offload_state_to_cpu=args.offload_state, async_loading_frames=False)
 predictor.reset_state(inference_state)
 
 ann_frame_idx = 0   
@@ -223,7 +225,7 @@ _, out_obj_ids, out_mask_logits = predictor.add_new_points(
 )
 
 # This sanity check was only needed when setting up the code
-# display_annotation_frame(frames_dir, frame_names, ann_frame_idx, points, labels, out_mask_logits, out_obj_ids)
+# display_annotation_frame(frames_dir, frame_names, ann_frame_idx, box, labels, out_mask_logits, out_obj_ids)
 
 if device.type == "cuda":
     allocated = torch.cuda.memory_allocated(device=device) / (1024 ** 3)  
@@ -242,9 +244,9 @@ save_processed_images(frames_dir, frame_names, video_segments, frame_stride=1, o
 
 """
 TODO:
-    1) Fix the issue of the complete tracklet not fitting into VRAM; in that case split the video into two, and input the mask of the last frame of the first half into the second half
-    2) use predictor.add_new_points_or_box(), and see if the results using a bounding box as prompt are as good as using 2 points as a prompt (since bounding boxes can be automatically extracted from a lightweight model like YOLO). 
-    3) if the output masks are good, then see if YOLOv11 generates good bounding boxes for a few sample tracklets
+    [X] 1) Fix the issue of the complete tracklet not fitting into VRAM; in that case split the video into two, and input the mask of the last frame of the first half into the second half
+    [X] 2) use predictor.add_new_points_or_box(), and see if the results using a bounding box as prompt are as good as using 2 points as a prompt (since bounding boxes can be automatically extracted from a lightweight model like YOLO). 
+    [X] 3) if the output masks are good, then see if YOLOv11 generates good bounding boxes for a few sample tracklets
 
 For testing bbox: here is a manually annotated bbox for frame 0, to pass into SAM2. This will simulate getting an automatic bounding box with the first player
     "x": "27.55",
@@ -252,7 +254,14 @@ For testing bbox: here is a manually annotated bbox for frame 0, to pass into SA
     "width": "42.04",
     "height": "127.14"
 
-    4) Figure out what format sam2 expects bounding boxes to be in
+    [X] 4) Figure out what format sam2 expects bounding boxes to be in. 
+        Answer: (x_min,y_min,x_max,y_max)
+    
+    [x] 5) Fix problem with bounding box inputs not producing good masks.
+    [] 6) Experiment with different image sizes
+    [] 7) Try whether padding all images to be the same size (max height x max width) improves the output
+    [] 8) Come up with algorithm for determining whether key player was NOT in the first frame
+    [] 9) Automate YOLO bbox -> SAM2 pipeline
 """
 
 """
@@ -270,4 +279,18 @@ Tests conducted with 360 frames in /sample_frames2 (copied SoccerNet data train/
     Offload video: 9+123, 400MB allocated
 
 Summary: actual outputs are identical whether we offload or not. Probably worth offloading the video.
+"""
+
+"""
+Experimenting with async_loading_frames=True results in better masks somehow, and basically eliminates the loading time (saving around 5 sec/100 frames)
+"""
+
+"""
+Experimenting with changing image_size in sam2/configs/sam2.1/sam2.1_hiera_l.yaml to see if it takes less time
+
+Tests with image size = 512, async loading, and offloading video to CPU.
+    Total time: 20 seconds
+
+
+
 """
