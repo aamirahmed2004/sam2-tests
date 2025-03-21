@@ -1,17 +1,21 @@
-from ultralytics import YOLO
+from ultralyticsplus import YOLO, render_result
 
-# Load a model
-model = YOLO("yolo11n.pt")  # pretrained YOLO11n model
+# load model
+model = YOLO('uisikdag/football_players_rf')
 
-# Run batched inference on a list of images
-results = model(["sample_frames/0_1.jpg", "sample_frames2/2_1.jpg"])  # return a list of Results objects
+# set model parameters
+model.overrides['conf'] = 0.25  # NMS confidence threshold
+model.overrides['iou'] = 0.45  # NMS IoU threshold
+model.overrides['agnostic_nms'] = False  # NMS class-agnostic
+model.overrides['max_det'] = 1000  # maximum number of detections per image
 
-# Process results list
-for result in results:
-    boxes = result.boxes  # Boxes object for bounding box outputs
-    masks = result.masks  # Masks object for segmentation masks outputs
-    keypoints = result.keypoints  # Keypoints object for pose outputs
-    probs = result.probs  # Probs object for classification outputs
-    obb = result.obb  # Oriented boxes object for OBB outputs
-    result.show()  # display to screen
-    result.save(filename="result.jpg")  # save to disk
+# set image
+image = 'upscaled.jpg'
+
+# perform inference
+results = model.predict(image)
+
+# observe results
+print(results[0].boxes)
+render = render_result(model=model, image=image, result=results[0])
+render.show()

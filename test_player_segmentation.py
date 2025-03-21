@@ -37,7 +37,7 @@ BASE_PATH = "C:\\Users\\syeda\\OneDrive\\Desktop\\4th Year\\COSC419\\sam2-tests"
 CHKPT_PATH = os.path.join(BASE_PATH, "checkpoints", "sam2.1_hiera_large.pt")
 CONFIG_PATH = os.path.join(BASE_PATH, "sam2", "configs", "sam2.1", "sam2.1_hiera_l.yaml")
 
-def show_mask(mask, ax, obj_id=None, image_size=None):
+def show_mask(mask, ax, obj_id=None, image_size=None, mask_bg=False):
 
     # Chosing a color
     cmap = plt.get_cmap("tab10")
@@ -58,9 +58,68 @@ def show_mask(mask, ax, obj_id=None, image_size=None):
 
     assert(len(mask.shape) == 2)
     h, w = mask.shape
-    # Create an overlay image by reshaping the mask and multiplying by the color
-    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+
+    if mask_bg:
+        # Create an image with the mask applied, everything else black
+        mask_image = np.zeros((h, w, 3), dtype=np.float32)
+        mask_image[mask] = color[:3]
+    else:
+        # Create an overlay image by reshaping the mask and multiplying by the color
+        mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+
     ax.imshow(mask_image)
+
+def apply_mask(image, mask, obj_id=None, image_size=None, mask_bg=False):
+    """
+    Applies a mask on the image and returns the masked image as a NumPy array.
+
+    Args:
+        image (PIL.Image or np.array): The original image.
+        mask (np.array): The mask array (2D or 3D array).
+        obj_id (int): ID used for mask color.
+        image_size (tuple): The size to resize the mask.
+        mask_bg (bool): Whether to apply the mask as a background.
+
+    Returns:
+        np.array: The masked image.
+    """
+    # Ensure image is in NumPy format
+    if isinstance(image, Image.Image):
+        image = np.array(image)
+
+    # Squeeze mask to handle extraneous dimensions
+    mask = np.squeeze(mask)  # Removes singleton dimensions
+
+    # Check dimensions after squeezing
+    if len(mask.shape) != 2:
+        raise ValueError(f"Unexpected mask shape: {mask.shape}. Expected 2D mask.")
+
+    # Resize mask to match the image size
+    if image_size is not None:
+        mask = Image.fromarray((mask.astype(np.uint8) * 255))
+        mask = mask.resize(image_size, resample=Image.NEAREST)
+        mask = np.array(mask) > 128  # Convert back to boolean mask
+
+    # Generate color for the mask
+    cmap = plt.get_cmap("tab10")
+    color = np.array([*cmap(obj_id if obj_id is not None else 0)[:3]]) * 255  # RGB
+
+    # Apply the mask
+    if mask_bg:
+        # Mask the image itself
+        masked_image = np.zeros_like(image, dtype=np.uint8)
+        for c in range(3):
+            masked_image[:, :, c] = np.where(mask, image[:, :, c], 0)
+    else:
+        # Overlay mask with color on the image
+        masked_image = image.copy()
+        alpha = 0.6
+        for c in range(3):
+            masked_image[:, :, c] = np.where(mask, 
+                                             (1 - alpha) * image[:, :, c] + alpha * color[c], 
+                                             image[:, :, c])
+
+    return masked_image
 
 def show_chosen_points(coords, labels, ax, marker_size=200):
     pos_points = coords[labels==1]
@@ -103,7 +162,6 @@ def save_processed_images(frames_dir, frame_names, video_segments, frame_stride=
     print("Saving processed images")
     plt.close("all")
 
-    fig = plt.figure(figsize=(6, 4))
     final_output_dir = os.path.join(BASE_PATH, output_dir, SAMPLE_FRAMES_DIR)
     if not os.path.exists(final_output_dir):
         os.mkdir(final_output_dir)
@@ -121,17 +179,13 @@ def save_processed_images(frames_dir, frame_names, video_segments, frame_stride=
         image = Image.open(image_path)
         image_size = image.size  # Ensure masks match this size
 
-        plt.title(f"frame {out_frame_idx}")
-        plt.imshow(image, animated=True)
-
+        masked_image = np.array(image)
         for out_obj_id, out_mask in video_segments[out_frame_idx].items():
-            show_mask(out_mask, plt.gca(), obj_id=out_obj_id, image_size=image_size)
+            masked_image = apply_mask(masked_image, out_mask, obj_id=out_obj_id, image_size=image_size, mask_bg=True)
 
-        output_path = os.path.join(final_output_dir, f'run{counter}_frame{out_frame_idx}.png')
-
-        # print("Saving image", out_frame_idx)
-        plt.savefig(output_path, bbox_inches='tight', pad_inches=0)
-        plt.clf()  # clear the figure to avoid overlapping of images
+        # Convert NumPy array back to PIL and save as JPG
+        output_path = os.path.join(final_output_dir, f'run{counter}_frame{out_frame_idx}.jpg')
+        Image.fromarray(masked_image).save(output_path, "JPEG")
 
 def overlay_box(box, ax):   
     """
@@ -190,7 +244,7 @@ print(f"  Reserved: {model_reserved / (1024 ** 3):.2f} GB")
 # Don't need to display initial frame after we choose the points 
 # display_initial_frame(frames_dir, frame_names)
 
-inference_state = predictor.init_state(video_path=frames_dir, offload_video_to_cpu=args.offload_video, offload_state_to_cpu=args.offload_state, async_loading_frames=False)
+inference_state = predictor.init_state(video_path=frames_dir, offload_video_to_cpu=args.offload_video, offload_state_to_cpu=args.offload_state, async_loading_frames=True)
 predictor.reset_state(inference_state)
 
 ann_frame_idx = 0   
@@ -198,12 +252,17 @@ ann_obj_id = 1      # this is the ID for the player, we could have chosen any in
 
 # No longer using points as prompt since we cannot extract that automatically 
 # points = np.array([[35,40], [20,60]], dtype = np.float32) 
-box = []
-if args.frames_dir == "sample_frames":
-    box = np.array([[8,7], [50,131]])
-elif args.frames_dir == "sample_frames2":
-    box = np.array([[3,3], [50,125]])       
-labels = np.array([1,1], np.int32)      # this tells the predictor that the points in the previous line correspond to the same target object
+# box = []
+# if args.frames_dir == "sample_frames":
+#     box = np.array([[8,7], [50,131]])
+# elif args.frames_dir == "sample_frames2":
+#     box = np.array([[3,3], [50,125]])
+# else:
+# Assign bounding box to the entire image
+image = Image.open(os.path.join(frames_dir, frame_names[0]))
+width, height = image.size
+box = np.array([[5, 5], [width-6, height-6]])
+labels = np.array([1,1], np.int32)  # this tells the predictor that the points in the previous line correspond to the same target object
 
 # Display the initial frame with the bounding box overlay
 if visualize_bbox:
