@@ -21,6 +21,9 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import argparse
 from sam2.build_sam import build_sam2_video_predictor 
+import cv2
+import time 
+from skimage.measure import label
 
 if torch.cuda.is_available():
     device = torch.device("cuda")
@@ -69,7 +72,12 @@ def show_mask(mask, ax, obj_id=None, image_size=None, mask_bg=False):
 
     ax.imshow(mask_image)
 
-def apply_mask(image, mask, obj_id=None, image_size=None, mask_bg=False):
+def getLargestCC(segmentation):
+    labels = label(segmentation)
+    largestCC = labels == np.argmax(np.bincount(labels.flat, weights=segmentation.flat))
+    return largestCC
+
+def apply_mask(image, mask, obj_id=None, image_size=None, mask_bg=False, morph=False):
     """
     Applies a mask on the image and returns the masked image as a NumPy array.
 
@@ -79,6 +87,7 @@ def apply_mask(image, mask, obj_id=None, image_size=None, mask_bg=False):
         obj_id (int): ID used for mask color.
         image_size (tuple): The size to resize the mask.
         mask_bg (bool): Whether to apply the mask as a background.
+        morph (bool): Whether to apply opening to get rid of noise followed by another round of dilation to slightly expand the mask.
 
     Returns:
         np.array: The masked image.
@@ -86,6 +95,8 @@ def apply_mask(image, mask, obj_id=None, image_size=None, mask_bg=False):
     # Ensure image is in NumPy format
     if isinstance(image, Image.Image):
         image = np.array(image)
+    
+    height, width = image.shape[:2]
 
     # Squeeze mask to handle extraneous dimensions
     mask = np.squeeze(mask)  # Removes singleton dimensions
@@ -104,9 +115,32 @@ def apply_mask(image, mask, obj_id=None, image_size=None, mask_bg=False):
     cmap = plt.get_cmap("tab10")
     color = np.array([*cmap(obj_id if obj_id is not None else 0)[:3]]) * 255  # RGB
 
-    # Apply the mask
+    if morph:
+        mask_uint8 = (mask.astype(np.uint8)) * 255
+
+        # Kernels for morphological operations
+        open_kernel = np.ones((3, 3), np.uint8)
+        dilation_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+        # Apply morphological opening to remove small noise (erosion followed by dilation)
+        mask_open = cv2.morphologyEx(mask_uint8, cv2.MORPH_OPEN, open_kernel)
+        # Dilate the mask after opening to expand the masked regions slightly
+        mask_dilated = cv2.dilate(mask_open, dilation_kernel, iterations=1)
+
+        mask = mask_dilated > 128
+    
+    if np.sum(mask) > 0:    # if there is at least one masked region
+        largest_cc = getLargestCC(mask)
+        # Check if the area of the largest component is at least 20% of the image area. If not, set the entire mask to 0's
+        if np.sum(largest_cc) >= 0.2 * (height * width):
+            mask = largest_cc
+        else:
+            mask = np.zeros_like(mask, dtype=bool)
+    else:
+        mask = np.zeros_like(mask, dtype=bool)
+
     if mask_bg:
-        # Mask the image itself
+        # Mask the image itself i.e. remove the background 
         masked_image = np.zeros_like(image, dtype=np.uint8)
         for c in range(3):
             masked_image[:, :, c] = np.where(mask, image[:, :, c], 0)
@@ -127,20 +161,20 @@ def show_chosen_points(coords, labels, ax, marker_size=200):
     ax.scatter(pos_points[:, 0], pos_points[:, 1], color='green', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)
     ax.scatter(neg_points[:, 0], neg_points[:, 1], color='red', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)
 
-def display_initial_frame(frames_dir, frame_names, frame_idx=0):
+def display_initial_frame(frames_path, frame_names, frame_idx=0):
     """
     This was used only to display the frame with matplotlib's axes so I could manually find 2 points on the target player.
     """
     plt.figure(figsize=(12, 8))
     plt.title(f"Frame {frame_idx}")
-    plt.imshow(Image.open(os.path.join(frames_dir, frame_names[frame_idx])))
+    plt.imshow(Image.open(os.path.join(frames_path, frame_names[frame_idx])))
     plt.show()
 
     print("Press key to continue")
     input()
     print("Continuing")
 
-def display_annotation_frame(frames_dir, frame_names, ann_frame_idx, points, labels, out_mask_logits, out_obj_ids):
+def display_annotation_frame(frames_path, frame_names, ann_frame_idx, points, labels, out_mask_logits, out_obj_ids):
     """
     This was used to display the initial mask returned by the predictor as a sanity check, before running the entire video through the model.
     
@@ -148,7 +182,7 @@ def display_annotation_frame(frames_dir, frame_names, ann_frame_idx, points, lab
     """
     plt.figure(figsize=(12, 8))
     plt.title(f"frame {ann_frame_idx}")
-    plt.imshow(Image.open(os.path.join(frames_dir, frame_names[ann_frame_idx])))
+    plt.imshow(Image.open(os.path.join(frames_path, frame_names[ann_frame_idx])))
     show_chosen_points(points, labels, plt.gca())
     show_mask((out_mask_logits[0] > 0.0).cpu().numpy(), plt.gca(), obj_id=out_obj_ids[0])
     plt.show()
@@ -157,12 +191,14 @@ def display_annotation_frame(frames_dir, frame_names, ann_frame_idx, points, lab
     input()
     print("Continuing")
 
-def save_processed_images(frames_dir, frame_names, video_segments, frame_stride=1, output_dir="sam2_outputs"):
+def save_processed_images(frames_path, frame_names, video_segments, frame_stride=1, output_dir="sam2_outputs", morph_mask=False):
 
     print("Saving processed images")
+    num_skipped_frames = 0
+    start_time = time.time()
     plt.close("all")
 
-    final_output_dir = os.path.join(BASE_PATH, output_dir, SAMPLE_FRAMES_DIR)
+    final_output_dir = os.path.join(BASE_PATH, output_dir, INPUT_DIR)
     if not os.path.exists(final_output_dir):
         os.mkdir(final_output_dir)
 
@@ -175,17 +211,24 @@ def save_processed_images(frames_dir, frame_names, video_segments, frame_stride=
         output_path = os.path.join(final_output_dir, f'run{counter}_frame0.png')  
 
     for out_frame_idx in range(0, len(frame_names), frame_stride):
-        image_path = os.path.join(frames_dir, frame_names[out_frame_idx])
+        image_path = os.path.join(frames_path, frame_names[out_frame_idx])
         image = Image.open(image_path)
         image_size = image.size  # Ensure masks match this size
 
         masked_image = np.array(image)
-        for out_obj_id, out_mask in video_segments[out_frame_idx].items():
-            masked_image = apply_mask(masked_image, out_mask, obj_id=out_obj_id, image_size=image_size, mask_bg=True)
+        for out_obj_id, out_mask in video_segments[out_frame_idx].items():  # this loop only runs once because there is only one obj id.
+            masked_image = apply_mask(masked_image, out_mask, obj_id=out_obj_id, image_size=image_size, mask_bg=True, morph=morph_mask)
 
-        # Convert NumPy array back to PIL and save as JPG
-        output_path = os.path.join(final_output_dir, f'run{counter}_frame{out_frame_idx}.jpg')
-        Image.fromarray(masked_image).save(output_path, "JPEG")
+        # Check if masked_image is all zeros
+        if np.any(masked_image):
+            output_path = os.path.join(final_output_dir, f'run{counter}_frame{out_frame_idx}.jpg')
+            Image.fromarray(masked_image).save(output_path, "JPEG")
+        else:
+            num_skipped_frames += 1
+        
+    print(f"Time taken for saving images: {time.time() - start_time:.2f} seconds.")
+    print(f"Number of frames skipped: {num_skipped_frames}")
+    return num_skipped_frames
 
 def overlay_box(box, ax):   
     """
@@ -196,15 +239,80 @@ def overlay_box(box, ax):
     rect = plt.Rectangle((x1, y1), x2-x1, y2-y1, linewidth=2, edgecolor='blue', facecolor='none')
     ax.add_patch(rect)
 
+def get_max_height_and_width(frames_path):
+    widths = []
+    heights = []
+    
+    # Iterate over files in the directory
+    for filename in os.listdir(frames_path):
+        if filename.lower().endswith(".jpg"):
+            img_path = os.path.join(frames_path, filename)
+            try:
+                with Image.open(img_path) as img:
+                    w, h = img.size
+                    widths.append(w)
+                    heights.append(h)
+            except Exception as e:
+                print(f"Error loading image {img_path}: {e}")
+    
+    if not widths or not heights:
+        print("No images processed successfully.")
+        return
+    
+    return np.max(heights), np.max(widths)
+
+def resize_and_pad_images(input_dir):
+
+    output_dir = input_dir + "_resized"
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    max_height, max_width = get_max_height_and_width(input_dir)
+    pad_amounts = None
+    
+    for idx, filename in enumerate(os.listdir(input_dir)):
+        if filename.lower().endswith(".jpg"):
+            img_path = os.path.join(input_dir, filename)
+            try:
+                with Image.open(img_path) as img:
+                    # Create a new image with the max dimensions and a black background
+                    new_img = Image.new("RGB", (max_width, max_height), (0, 0, 0))
+                    # Calculate padding amounts
+                    pad_horiz = (max_width - img.width) // 2
+                    pad_vert = (max_height - img.height) // 2
+                    # Paste the original image onto the center of the new image
+                    new_img.paste(img, (pad_horiz, pad_vert))
+                    # Save the new image to the output directory
+                    new_img.save(os.path.join(output_dir, filename))
+                    
+                    # Track pad amounts for the first image only
+                    if idx == 0:
+                        pad_amounts = (pad_horiz, pad_vert)
+            except Exception as e:
+                print(f"Error processing image {img_path}: {e}")
+    
+    return pad_amounts
+
 parser = argparse.ArgumentParser(description="Testing Offloading Options for SAM2")
 parser.add_argument("--visualize", action="store_true", help="Visualize bbox of first frame before running the model")
 parser.add_argument("--offload_video", action="store_true", help="Offload video to CPU")
 parser.add_argument("--offload_state", action="store_true", help="Offload state to CPU")
+parser.add_argument("--resize", action="store_true", help="Resize the frames in input frames directory to max height and width")
+parser.add_argument("--morph", action="store_true", help="Applies opening followed by dilation on the output masks")
 parser.add_argument("--frames_dir", type=str, default="sample_frames", help="Directory containing the frames to input to the model")
 args = parser.parse_args()
 
-SAMPLE_FRAMES_DIR = args.frames_dir
-visualize_bbox = args.visualize
+sample_frames_dir = args.frames_dir
+pad_horiz, pad_vert = 0,0
+
+
+if args.resize:
+    start_time = time.time()
+    pad_horiz, pad_vert = resize_and_pad_images(sample_frames_dir)
+    INPUT_DIR = sample_frames_dir + "_resized"
+    print(f"Time taken for resizing and padding images: {time.time() - start_time:.2f} seconds")
+else:
+    INPUT_DIR = sample_frames_dir
 
 if args.offload_video and args.offload_state:
     OUTPUT_DIR = "offload_both_outputs"
@@ -219,14 +327,16 @@ else:
     OUTPUT_DIR = "sam2_outputs"
     print("Loading inference state and video frames to GPU memory")
 
+OUTPUT_DIR = "mask_QA_outputs"
+
 # Change to absolute path
 OUTPUT_DIR = os.path.join(BASE_PATH, OUTPUT_DIR)
 if not os.path.exists(OUTPUT_DIR):
     os.mkdir(OUTPUT_DIR)
 
-frames_dir = os.path.join(BASE_PATH, SAMPLE_FRAMES_DIR)
+frames_path = os.path.join(BASE_PATH, INPUT_DIR)
 frame_names = [
-    p for p in os.listdir(frames_dir)
+    p for p in os.listdir(frames_path)
     if os.path.splitext(p)[-1] == ".jpg"
 ]
 frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
@@ -242,9 +352,9 @@ print(f"  Allocated: {model_allocated / (1024 ** 3):.2f} GB")
 print(f"  Reserved: {model_reserved / (1024 ** 3):.2f} GB")
 
 # Don't need to display initial frame after we choose the points 
-# display_initial_frame(frames_dir, frame_names)
+# display_initial_frame(frames_path, frame_names)
 
-inference_state = predictor.init_state(video_path=frames_dir, offload_video_to_cpu=args.offload_video, offload_state_to_cpu=args.offload_state, async_loading_frames=True)
+inference_state = predictor.init_state(video_path=frames_path, offload_video_to_cpu=args.offload_video, offload_state_to_cpu=args.offload_state, async_loading_frames=True)
 predictor.reset_state(inference_state)
 
 ann_frame_idx = 0   
@@ -253,22 +363,26 @@ ann_obj_id = 1      # this is the ID for the player, we could have chosen any in
 # No longer using points as prompt since we cannot extract that automatically 
 # points = np.array([[35,40], [20,60]], dtype = np.float32) 
 # box = []
-# if args.frames_dir == "sample_frames":
+# if args.frames_path == "sample_frames":
 #     box = np.array([[8,7], [50,131]])
-# elif args.frames_dir == "sample_frames2":
+# elif args.frames_path == "sample_frames2":
 #     box = np.array([[3,3], [50,125]])
 # else:
 # Assign bounding box to the entire image
-image = Image.open(os.path.join(frames_dir, frame_names[0]))
+image = Image.open(os.path.join(frames_path, frame_names[0]))
 width, height = image.size
-box = np.array([[5, 5], [width-6, height-6]])
 labels = np.array([1,1], np.int32)  # this tells the predictor that the points in the previous line correspond to the same target object
 
+if args.resize:
+    box = np.array([[pad_horiz+3, pad_vert+3], [width - (pad_horiz+4), height - (pad_vert+4)]])
+else:
+    box = np.array([[5, 5], [width-6, height-6]])
+
 # Display the initial frame with the bounding box overlay
-if visualize_bbox:
+if args.visualize:
     plt.figure(figsize=(12, 8))
     plt.title(f"Frame {ann_frame_idx}")
-    image = Image.open(os.path.join(frames_dir, frame_names[ann_frame_idx]))
+    image = Image.open(os.path.join(frames_path, frame_names[ann_frame_idx]))
     plt.imshow(image)
     overlay_box(box, plt.gca())
     plt.show()
@@ -284,7 +398,7 @@ _, out_obj_ids, out_mask_logits = predictor.add_new_points(
 )
 
 # This sanity check was only needed when setting up the code
-# display_annotation_frame(frames_dir, frame_names, ann_frame_idx, box, labels, out_mask_logits, out_obj_ids)
+# display_annotation_frame(frames_path, frame_names, ann_frame_idx, box, labels, out_mask_logits, out_obj_ids)
 
 if device.type == "cuda":
     allocated = torch.cuda.memory_allocated(device=device) / (1024 ** 3)  
@@ -299,7 +413,17 @@ for out_frame_idx , out_obj_ids, out_mask_logits in predictor.propagate_in_video
         for i, out_obj_id in enumerate(out_obj_ids)
     }
 
-save_processed_images(frames_dir, frame_names, video_segments, frame_stride=1, output_dir=OUTPUT_DIR)
+# if args.resize:
+#     for filename in os.listdir(INPUT_DIR):
+#         file_path = os.path.join(INPUT_DIR, filename)
+#         try:
+#             if os.path.isfile(file_path):
+#                 os.remove(file_path)
+#         except Exception as e:
+#             print(f"Error deleting file {file_path}: {e}")
+#     os.rmdir(INPUT_DIR)
+    
+save_processed_images(frames_path, frame_names, video_segments, frame_stride=1, output_dir=OUTPUT_DIR)
 
 """
 TODO:
@@ -352,4 +476,10 @@ Tests with image size = 512, async loading, and offloading video to CPU.
 
 
 
+"""
+
+"""
+Experimenting with padding the frames to max_height and max_width of all the frames in the tracklet since SAM2 expects uniformly sized frames for a video. 
+
+Did not work because it thinks our pseudo-bounding boxes are telling it to keep track of the entire frame including background. Output masks are much worse and have more noise.
 """

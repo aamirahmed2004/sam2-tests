@@ -17,3 +17,4 @@ offload_video_outputs/
 offload_both_outputs/
 sample_frames*/
 *.pt
+masked_outputs.zip
