@@ -120,7 +120,7 @@ def apply_mask(image, mask, obj_id=None, image_size=None, mask_bg=False, morph=F
 
         # Kernels for morphological operations
         open_kernel = np.ones((3, 3), np.uint8)
-        dilation_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        dilation_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (10, 10))
 
         # Apply morphological opening to remove small noise (erosion followed by dilation)
         mask_open = cv2.morphologyEx(mask_uint8, cv2.MORPH_OPEN, open_kernel)
@@ -297,22 +297,12 @@ parser = argparse.ArgumentParser(description="Testing Offloading Options for SAM
 parser.add_argument("--visualize", action="store_true", help="Visualize bbox of first frame before running the model")
 parser.add_argument("--offload_video", action="store_true", help="Offload video to CPU")
 parser.add_argument("--offload_state", action="store_true", help="Offload state to CPU")
-parser.add_argument("--resize", action="store_true", help="Resize the frames in input frames directory to max height and width")
+# parser.add_argument("--resize", action="store_true", help="Resize the frames in input frames directory to max height and width")
 parser.add_argument("--morph", action="store_true", help="Applies opening followed by dilation on the output masks")
 parser.add_argument("--frames_dir", type=str, default="sample_frames", help="Directory containing the frames to input to the model")
 args = parser.parse_args()
 
-sample_frames_dir = args.frames_dir
-pad_horiz, pad_vert = 0,0
-
-
-if args.resize:
-    start_time = time.time()
-    pad_horiz, pad_vert = resize_and_pad_images(sample_frames_dir)
-    INPUT_DIR = sample_frames_dir + "_resized"
-    print(f"Time taken for resizing and padding images: {time.time() - start_time:.2f} seconds")
-else:
-    INPUT_DIR = sample_frames_dir
+INPUT_DIR = args.frames_dir
 
 if args.offload_video and args.offload_state:
     OUTPUT_DIR = "offload_both_outputs"
@@ -360,23 +350,15 @@ predictor.reset_state(inference_state)
 ann_frame_idx = 0   
 ann_obj_id = 1      # this is the ID for the player, we could have chosen any integer
 
-# No longer using points as prompt since we cannot extract that automatically 
-# points = np.array([[35,40], [20,60]], dtype = np.float32) 
-# box = []
-# if args.frames_path == "sample_frames":
-#     box = np.array([[8,7], [50,131]])
-# elif args.frames_path == "sample_frames2":
-#     box = np.array([[3,3], [50,125]])
-# else:
 # Assign bounding box to the entire image
 image = Image.open(os.path.join(frames_path, frame_names[0]))
 width, height = image.size
 labels = np.array([1,1], np.int32)  # this tells the predictor that the points in the previous line correspond to the same target object
 
-if args.resize:
-    box = np.array([[pad_horiz+3, pad_vert+3], [width - (pad_horiz+4), height - (pad_vert+4)]])
-else:
-    box = np.array([[5, 5], [width-6, height-6]])
+# if args.resize:
+#     box = np.array([[pad_horiz+3, pad_vert+3], [width - (pad_horiz+4), height - (pad_vert+4)]])
+# else:
+box = np.array([[5, 5], [width-6, height-6]])
 
 # Display the initial frame with the bounding box overlay
 if args.visualize:
@@ -413,15 +395,6 @@ for out_frame_idx , out_obj_ids, out_mask_logits in predictor.propagate_in_video
         for i, out_obj_id in enumerate(out_obj_ids)
     }
 
-# if args.resize:
-#     for filename in os.listdir(INPUT_DIR):
-#         file_path = os.path.join(INPUT_DIR, filename)
-#         try:
-#             if os.path.isfile(file_path):
-#                 os.remove(file_path)
-#         except Exception as e:
-#             print(f"Error deleting file {file_path}: {e}")
-#     os.rmdir(INPUT_DIR)
     
 save_processed_images(frames_path, frame_names, video_segments, frame_stride=1, output_dir=OUTPUT_DIR)
 
@@ -441,13 +414,12 @@ For testing bbox: here is a manually annotated bbox for frame 0, to pass into SA
         Answer: (x_min,y_min,x_max,y_max)
     
     [x] 5) Fix problem with bounding box inputs not producing good masks.
-    [] 6) Experiment with different image sizes
-    [] 7) Try whether padding all images to be the same size (max height x max width) improves the output
-    [] 8) Come up with algorithm for determining whether key player was NOT in the first frame
-    [] 9) Automate YOLO bbox -> SAM2 pipeline
-"""
-
-"""
+    [x] 6) Experiment with different image sizes
+    [x] 7) Try whether padding all images to be the same size (max height x max width) improves the output
+    [x] 8) Come up with algorithm for determining whether key player was NOT in the first frame
+    [x] 9) Automate YOLO bbox -> SAM2 pipeline
+    [] 10) Figure out a method of eliminating frames based on a) size of image relative to average size, b) size of mask, c) movement?.
+-----------------------
 Experimenting to find the time taken and memory consumption to run the model while offloading state to CPU and/or offloading video to CPU
 
 Tests conducted with 112 frames in /sample_frames: 
@@ -462,23 +434,21 @@ Tests conducted with 360 frames in /sample_frames2 (copied SoccerNet data train/
     Offload video: 9+123, 400MB allocated
 
 Summary: actual outputs are identical whether we offload or not. Probably worth offloading the video.
-"""
-
-"""
+-----------------------
 Experimenting with async_loading_frames=True results in better masks somehow, and basically eliminates the loading time (saving around 5 sec/100 frames)
-"""
-
-"""
+-----------------------
 Experimenting with changing image_size in sam2/configs/sam2.1/sam2.1_hiera_l.yaml to see if it takes less time
 
 Tests with image size = 512, async loading, and offloading video to CPU.
     Total time: 20 seconds
 
+Tests with image size = 384 (128*3), async loading, and offloading to CPU.
+    Total time: 18 seconds, but IT DID NOT DETECT ANY MASKS
 
+Tests with image size = 640 (128*5), async loading, and offloading to CPU.
+    Total time: 36 seconds
 
-"""
-
-"""
+-----------------------
 Experimenting with padding the frames to max_height and max_width of all the frames in the tracklet since SAM2 expects uniformly sized frames for a video. 
 
 Did not work because it thinks our pseudo-bounding boxes are telling it to keep track of the entire frame including background. Output masks are much worse and have more noise.
