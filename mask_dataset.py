@@ -9,6 +9,16 @@ import cv2
 import time 
 from skimage.measure import label
 
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
+    print("Using CPU, not recommended.")
+
+# For efficiency
+if device.type == "cuda":
+    torch.autocast("cuda", dtype = torch.float16).__enter__()
+
 def getLargestCC(segmentation):
     labels = label(segmentation)
     largestCC = labels == np.argmax(np.bincount(labels.flat, weights=segmentation.flat))
@@ -51,15 +61,12 @@ def apply_mask(image, mask, obj_id=None, image_size=None):
     mask_uint8 = (mask.astype(np.uint8)) * 255
 
     # Kernels for morphological operations
-    open_kernel = np.ones((4, 4), np.uint8)
-    dilation_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (4,4))
+    open_kernel = np.ones((3, 3), np.uint8)
+    dilation_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
     # Apply morphological opening to remove small noise (erosion followed by dilation)
     mask_open = cv2.morphologyEx(mask_uint8, cv2.MORPH_OPEN, open_kernel)
-    # Dilate the mask after opening to expand the masked regions slightly
-    mask_dilated = cv2.dilate(mask_open, dilation_kernel, iterations=2)
-
-    mask = mask_dilated > 128
+    mask = mask_open > 128
     
     if np.sum(mask) > 0:    # if there is at least one masked region
         largest_cc = getLargestCC(mask)
@@ -70,6 +77,10 @@ def apply_mask(image, mask, obj_id=None, image_size=None):
             mask = np.zeros_like(mask, dtype=bool)
     else:
         mask = np.zeros_like(mask, dtype=bool)
+
+    # Dilate the mask after keeping only the largest connected component
+    mask_dilated = cv2.dilate(mask.astype(np.uint8) * 255, dilation_kernel, iterations=2)
+    mask = mask_dilated > 128
 
     # Mask the image itself i.e. remove the background 
     masked_image = np.zeros_like(image, dtype=np.uint8)
@@ -117,6 +128,9 @@ CONFIG_PATH = os.path.join(BASE_PATH, "sam2", "configs", "sam2.1", "sam2.1_hiera
 INPUT_DIR = args.input_path
 MASKED_PARENT_DIR = INPUT_DIR + "_masked"
 
+if not os.path.exists(INPUT_DIR):
+    raise FileNotFoundError(f"Input directory {INPUT_DIR} does not exist.")
+
 if not os.path.exists(MASKED_PARENT_DIR):
     os.mkdir(MASKED_PARENT_DIR)
 
@@ -127,8 +141,13 @@ predictor = build_sam2_video_predictor(CONFIG_PATH, CHKPT_PATH, device=torch.dev
 # Dictionary to hold time taken to process (in seconds) and number of frames skipped, as a tuple
 tracklet_info = {}
 total_start_time = time.time()
+inference_state = None
 
 for tracklet in tracklet_dirs:
+
+    if inference_state is not None:
+        predictor.reset_state(inference_state)
+
     tracklet_path = os.path.join(INPUT_DIR, tracklet)
     output_dir = os.path.join(MASKED_PARENT_DIR, tracklet)
     if not os.path.exists(output_dir):
@@ -136,13 +155,17 @@ for tracklet in tracklet_dirs:
 
     frame_names = [p for p in os.listdir(tracklet_path) if os.path.splitext(p)[-1].lower() == ".jpg"]
     frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+        reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+        print(f"Before processing {tracklet}: GPU Memory - Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
     
     # Reset inference state for this tracklet and start timer
     start_time = time.time()
     inference_state = predictor.init_state(video_path=tracklet_path,
                                            offload_video_to_cpu=True,
                                            async_loading_frames=True)
-    predictor.reset_state(inference_state)
     
     # Use the first frame to assign a bounding box for the entire image.
     image = Image.open(os.path.join(tracklet_path, frame_names[0]))
@@ -167,6 +190,11 @@ for tracklet in tracklet_dirs:
             for i, out_obj_id in enumerate(out_obj_ids)
         }
     
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+        reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+        print(f"After processing {tracklet}: GPU Memory - Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
+    
     num_skipped = save_processed_images(tracklet_path, frame_names, video_segments, frame_stride=1, output_dir=output_dir)
     
     # Record and report time taken for this tracklet
@@ -179,7 +207,7 @@ total_end_time = time.time()
 total_elapsed = total_end_time - total_start_time
 
 # Write the timing info into a text file
-results_file = os.path.join(MASKED_PARENT_DIR, "masking_results.txt")
+results_file = os.path.join(MASKED_PARENT_DIR, "masking_run_info.txt")
 with open(results_file, "w") as f:
     # Write each tracklet's timing info separated by commas
     for tracklet, t in tracklet_info.items():
