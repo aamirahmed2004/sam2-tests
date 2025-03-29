@@ -10,7 +10,7 @@ import os
 import torch
 from hydra import compose
 from hydra.utils import instantiate
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, DictConfig
 
 import sam2
 
@@ -86,8 +86,7 @@ def build_sam2(
             "++model.sam_mask_decoder_extra_args.dynamic_multimask_stability_delta=0.05",
             "++model.sam_mask_decoder_extra_args.dynamic_multimask_stability_thresh=0.98",
         ]
-    # Read config and init model
-    cfg = compose(config_name=config_file, overrides=hydra_overrides_extra)
+    cfg = config_file
     OmegaConf.resolve(cfg)
     model = instantiate(cfg.model, _recursive_=True)
     _load_checkpoint(model, ckpt_path)
@@ -130,8 +129,11 @@ def build_sam2_video_predictor(
         ]
     hydra_overrides.extend(hydra_overrides_extra)
 
-    # Read config and init model
-    cfg = compose(config_name=config_file, overrides=hydra_overrides)
+    # Check if config_file is already a composed OmegaConf DictConfig.
+    if isinstance(config_file, DictConfig):
+        cfg = config_file
+    else:
+        cfg = compose(config_name=config_file, overrides=hydra_overrides)
     OmegaConf.resolve(cfg)
     model = instantiate(cfg.model, _recursive_=True)
     _load_checkpoint(model, ckpt_path)

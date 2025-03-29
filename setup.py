@@ -141,9 +141,9 @@ try:
 
     cmdclass = {
         "build_ext": (
-            BuildExtensionIgnoreErrors.with_options(no_python_abi_suffix=True)
+            BuildExtensionIgnoreErrors.with_options()
             if BUILD_ALLOW_ERRORS
-            else BuildExtension.with_options(no_python_abi_suffix=True)
+            else BuildExtension.with_options()
         )
     }
 except Exception as e:

@@ -1,5 +1,7 @@
 import argparse
 import os
+import hydra
+from hydra import compose
 import time
 import numpy as np
 from PIL import Image
@@ -18,6 +20,27 @@ else:
 # For efficiency
 if device.type == "cuda":
     torch.autocast("cuda", dtype = torch.float16).__enter__()
+
+# FIXING CONFIG SEARCH PATH ISSUES WITH HYDRA
+# hydra is initialized on import of sam2, which sets the search path which can't be modified
+# so we need to clear the hydra instance
+hydra.core.global_hydra.GlobalHydra.instance().clear()
+# reinit hydra with a new search path for configs
+hydra.initialize(
+    config_path=os.path.join("sam2", "configs", "sam2.1"),
+    version_base='1.2'
+)
+
+# Adding overrides from sam2/build_sam.py
+hydra_overrides_extra = [
+	    "++model._target_=sam2.sam2_video_predictor.SAM2VideoPredictor",
+            # dynamically fall back to multi-mask if the single mask is not stable
+            "++model.sam_mask_decoder_extra_args.dynamic_multimask_via_stability=true",
+            "++model.sam_mask_decoder_extra_args.dynamic_multimask_stability_delta=0.05",
+            "++model.sam_mask_decoder_extra_args.dynamic_multimask_stability_thresh=0.98",
+        ]
+cfg = compose(config_name="sam2.1_hiera_l", overrides=hydra_overrides_extra)
+print("Loaded configuration:", cfg)
 
 def getLargestCC(segmentation):
     labels = label(segmentation)
@@ -136,7 +159,8 @@ if not os.path.exists(MASKED_PARENT_DIR):
 
 tracklet_dirs = [d for d in os.listdir(INPUT_DIR) if os.path.isdir(os.path.join(INPUT_DIR, d))]
 
-predictor = build_sam2_video_predictor(CONFIG_PATH, CHKPT_PATH, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+print("Building SAM2")
+predictor = build_sam2_video_predictor(cfg, CHKPT_PATH, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
 # Dictionary to hold time taken to process (in seconds) and number of frames skipped, as a tuple
 tracklet_info = {}
